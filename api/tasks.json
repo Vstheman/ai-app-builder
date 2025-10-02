@@ -1,0 +1,18 @@
+[
+  {
+    "text": "Have Lunch",
+    "done": true
+  },
+  {
+    "text": "Study till evening",
+    "done": false
+  },
+  {
+    "text": "Go for a walk",
+    "done": false
+  },
+  {
+    "text": "Complete silksong",
+    "done": false
+  }
+]
