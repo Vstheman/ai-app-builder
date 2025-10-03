@@ -1,146 +1,135 @@
 #!/usr/bin/env python3
 # api/ask_cli.py
 """
-Day 4 – Ask Anything CLI (OpenAI) with:
-- --temperature (creativity)
-- --json (force JSON output)
-- --log (append a JSONL record per run to logs/day04-ask.jsonl)
+Day 5 – Ask Anything CLI with Prompt Patterns
 
-Usage:
-  python api/ask_cli.py --prompt "Explain RAG in one sentence" --log
-  python api/ask_cli.py --prompt "Give 3 startup ideas in healthtech" --temperature 0.8 --log
-  python api/ask_cli.py --prompt "Transformers vs RNNs in 2 bullets" --json --log
+Patterns supported:
+  role      → Sets the model role/persona
+  json      → Forces JSON output
+  chain     → Encourages step-by-step reasoning
+  fewshot   → Provides in-context examples
+  guardrail → Adds safe fallback behavior
+
+Usage examples:
+  python api/ask_cli.py --prompt "Explain compound interest" --pattern role
+  python api/ask_cli.py --prompt "Summarize benefits of yoga" --pattern json
+  python api/ask_cli.py --prompt "37*42" --pattern chain
+  python api/ask_cli.py --prompt "Suggest names for an app" --pattern fewshot
+  python api/ask_cli.py --prompt "What’s the cure for cancer?" --pattern guardrail
 """
 
 import argparse, sys, json, os, datetime
 from pathlib import Path
 from openai import OpenAI
-from openai import APIStatusError
 
-LOG_PATH = Path("logs") / "day04-ask.jsonl"
+LOG_PATH = Path("logs") / "day05-ask.jsonl"
 
-def ask_openai(prompt: str, system: str, model: str, temperature: float, as_json: bool):
-    """
-    Calls OpenAI Chat Completions.
-    Returns (output_text: str, usage: dict|None).
-    """
-    client = OpenAI()
+# -------- PATTERN HANDLERS -------- #
 
-    sys_msg = system
-    if as_json:
-        # Strong instruction for strict JSON
-        sys_msg += (
-            "\nYou must respond using ONLY a single valid JSON object with the key 'answer'. "
-            "Do not include any extra text, explanations, or markdown."
+def build_messages(pattern, system, prompt):
+    """Return a list of messages depending on the chosen pattern."""
+    if pattern == "role":
+        system_msg = "You are a concise financial advisor."
+        return [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": prompt},
+        ]
+
+    elif pattern == "json":
+        system_msg = "You are a helpful assistant. Answer ONLY with a JSON object using the key 'answer'."
+        return [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": prompt},
+        ]
+
+    elif pattern == "chain":
+        system_msg = "You are a math tutor. Solve step by step, then give the final answer."
+        return [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": prompt},
+        ]
+
+    elif pattern == "fewshot":
+        system_msg = "You are a product naming assistant. Always answer in JSON with key 'names'."
+        examples = [
+            {"role": "user", "content": "Q: A fitness app"},
+            {"role": "assistant", "content": '{"names": ["FitFlow", "PulseTrack", "FlexBuddy"]}'},
+            {"role": "user", "content": "Q: A cooking assistant app"},
+            {"role": "assistant", "content": '{"names": ["ChefMate", "FlavorBot", "Cookly"]}'},
+            {"role": "user", "content": f"Q: {prompt}"},
+        ]
+        return [{"role": "system", "content": system_msg}] + examples
+
+    elif pattern == "guardrail":
+        system_msg = (
+            "You are a medical assistant. "
+            "If you are unsure or the question is unsafe, always respond: "
+            "'I cannot provide a definitive answer. Please consult a doctor.'"
         )
+        return [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": prompt},
+        ]
 
+    else:  # default
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ]
+
+# -------- MAIN APP -------- #
+
+def ask_openai(model, temperature, messages):
+    client = OpenAI()
     resp = client.chat.completions.create(
         model=model,
         temperature=temperature,
-        messages=[
-            {"role": "system", "content": sys_msg},
-            {"role": "user", "content": prompt},
-        ],
+        messages=messages,
     )
-    content = (resp.choices[0].message.content or "").strip()
-    usage = getattr(resp, "usage", None)
-    if usage:
-        usage = {
-            "prompt_tokens": usage.prompt_tokens,
-            "completion_tokens": usage.completion_tokens,
-            "total_tokens": usage.total_tokens,
-        }
-    return content, usage
+    return resp.choices[0].message.content or "", getattr(resp, "usage", None)
 
-def safe_json_answer(raw: str):
-    """
-    Ensure we always print valid JSON when --json is set.
-    If the model didn't return strict JSON, wrap it.
-    """
-    try:
-        obj = json.loads(raw)
-        if not isinstance(obj, dict) or "answer" not in obj:
-            obj = {"answer": raw.strip()}
-    except Exception:
-        obj = {"answer": raw.strip()}
-    return obj
-
-def append_log(record: dict):
+def append_log(record):
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with LOG_PATH.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 def main(argv=None):
-    p = argparse.ArgumentParser(description="Send a prompt to an LLM and print the reply.")
+    p = argparse.ArgumentParser(description="Ask an LLM with prompt patterns.")
     p.add_argument("--prompt", required=True, help="Your question / instruction.")
-    p.add_argument("--system", default="You are concise and helpful.", help="System instruction (tone/role).")
-    p.add_argument("--model", default="gpt-4o-mini", help="Model name (default: gpt-4o-mini).")
-    p.add_argument("--temperature", type=float, default=0.2, help="Creativity 0.0–1.0 (lower = more factual).")
-    p.add_argument("--json", action="store_true", help="Force the model to return JSON with key 'answer'.")
+    p.add_argument("--system", default="You are concise and helpful.", help="Default system role (if not using a pattern).")
+    p.add_argument("--model", default="gpt-4o-mini", help="Model (default: gpt-4o-mini).")
+    p.add_argument("--temperature", type=float, default=0.2, help="Creativity (0.0 factual, 0.8+ creative).")
+    p.add_argument("--pattern", choices=["role", "json", "chain", "fewshot", "guardrail"], help="Apply a prompt pattern.")
     p.add_argument("--log", action="store_true", help=f"Append a JSONL record to {LOG_PATH.as_posix()}")
     args = p.parse_args(argv)
 
     started_at = datetime.datetime.utcnow().isoformat() + "Z"
+
     try:
-        content, usage = ask_openai(
-            prompt=args.prompt,
-            system=args.system,
-            model=args.model,
-            temperature=args.temperature,
-            as_json=args.json,
-        )
+        msgs = build_messages(args.pattern, args.system, args.prompt)
+        content, usage = ask_openai(args.model, args.temperature, msgs)
 
-        if args.json:
-            obj = safe_json_answer(content)
-            output_text = json.dumps(obj, ensure_ascii=False)
-            print(output_text)
-        else:
-            output_text = content
-            print(output_text)
+        print(content.strip())
 
         if args.log:
             append_log({
                 "ts": started_at,
                 "prompt": args.prompt,
+                "pattern": args.pattern,
                 "system": args.system,
                 "model": args.model,
                 "temperature": args.temperature,
-                "as_json": args.json,
-                "output": obj if args.json else output_text,
-                "usage": usage,
-                "env": {
-                    "user": os.environ.get("USERNAME") or os.environ.get("USER"),
-                    "cwd": os.getcwd(),
-                }
+                "output": content.strip(),
+                "usage": {
+                    "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                    "completion_tokens": getattr(usage, "completion_tokens", None),
+                    "total_tokens": getattr(usage, "total_tokens", None),
+                },
+                "env": {"user": os.environ.get("USERNAME") or os.environ.get("USER")},
             })
 
-    except APIStatusError as e:
-        msg = f"OpenAI API error: {e.status_code} {e.message}"
-        print(f"❌ {msg}")
-        if args.log:
-            append_log({
-                "ts": started_at,
-                "prompt": args.prompt,
-                "system": args.system,
-                "model": args.model,
-                "temperature": args.temperature,
-                "as_json": args.json,
-                "error": msg
-            })
-        sys.exit(2)
     except Exception as e:
-        msg = f"Unexpected error: {e}"
-        print(f"❌ {msg}")
-        if args.log:
-            append_log({
-                "ts": started_at,
-                "prompt": args.prompt,
-                "system": args.system,
-                "model": args.model,
-                "temperature": args.temperature,
-                "as_json": args.json,
-                "error": msg
-            })
+        print(f"❌ Unexpected error: {e}")
         sys.exit(3)
 
 if __name__ == "__main__":
