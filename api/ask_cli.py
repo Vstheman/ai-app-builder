@@ -1,21 +1,15 @@
 #!/usr/bin/env python3
 # api/ask_cli.py
 """
-Day 5 – Ask Anything CLI with Prompt Patterns
+Day 5 – Ask Anything CLI with:
+- Prompt patterns (--pattern)
+- Temperature control (--temperature)
+- JSON output (--json via patterns)
+- Logging (--log)
+- Moderation (--moderate)
 
-Patterns supported:
-  role      → Sets the model role/persona
-  json      → Forces JSON output
-  chain     → Encourages step-by-step reasoning
-  fewshot   → Provides in-context examples
-  guardrail → Adds safe fallback behavior
-
-Usage examples:
-  python api/ask_cli.py --prompt "Explain compound interest" --pattern role
-  python api/ask_cli.py --prompt "Summarize benefits of yoga" --pattern json
-  python api/ask_cli.py --prompt "37*42" --pattern chain
-  python api/ask_cli.py --prompt "Suggest names for an app" --pattern fewshot
-  python api/ask_cli.py --prompt "What’s the cure for cancer?" --pattern guardrail
+Usage:
+  python api/ask_cli.py --prompt "What is 2+2?" --pattern guardrail --moderate
 """
 
 import argparse, sys, json, os, datetime
@@ -27,7 +21,6 @@ LOG_PATH = Path("logs") / "day05-ask.jsonl"
 # -------- PATTERN HANDLERS -------- #
 
 def build_messages(pattern, system, prompt):
-    """Return a list of messages depending on the chosen pattern."""
     if pattern == "role":
         system_msg = "You are a concise financial advisor."
         return [
@@ -62,8 +55,10 @@ def build_messages(pattern, system, prompt):
 
     elif pattern == "guardrail":
         system_msg = (
-            "You are a medical assistant. "
-            "If you are unsure or the question is unsafe, always respond: "
+            "You are a helpful assistant. "
+            "If the user asks a general question you know (like basic math, geography, history, science), answer normally. "
+            "If the question is about medicine, health, or anything you are not 100% sure of, "
+            "respond ONLY with this exact text: "
             "'I cannot provide a definitive answer. Please consult a doctor.'"
         )
         return [
@@ -88,24 +83,49 @@ def ask_openai(model, temperature, messages):
     )
     return resp.choices[0].message.content or "", getattr(resp, "usage", None)
 
+def check_moderation(client, text: str) -> bool:
+    """Return True if safe, False if flagged unsafe."""
+    result = client.moderations.create(model="omni-moderation-latest", input=text)
+    flagged = result.results[0].flagged
+    return not flagged
+
 def append_log(record):
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with LOG_PATH.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 def main(argv=None):
-    p = argparse.ArgumentParser(description="Ask an LLM with prompt patterns.")
+    p = argparse.ArgumentParser(description="Ask an LLM with patterns + moderation.")
     p.add_argument("--prompt", required=True, help="Your question / instruction.")
-    p.add_argument("--system", default="You are concise and helpful.", help="Default system role (if not using a pattern).")
+    p.add_argument("--system", default="You are concise and helpful.", help="Default system role.")
     p.add_argument("--model", default="gpt-4o-mini", help="Model (default: gpt-4o-mini).")
-    p.add_argument("--temperature", type=float, default=0.2, help="Creativity (0.0 factual, 0.8+ creative).")
-    p.add_argument("--pattern", choices=["role", "json", "chain", "fewshot", "guardrail"], help="Apply a prompt pattern.")
-    p.add_argument("--log", action="store_true", help=f"Append a JSONL record to {LOG_PATH.as_posix()}")
+    p.add_argument("--temperature", type=float, default=0.2, help="Creativity 0.0–1.0.")
+    p.add_argument("--pattern", choices=["role", "json", "chain", "fewshot", "guardrail"], help="Prompt pattern.")
+    p.add_argument("--log", action="store_true", help="Append JSONL record to logs/day05-ask.jsonl")
+    p.add_argument("--moderate", action="store_true", help="Use OpenAI Moderation API before sending prompt")
     args = p.parse_args(argv)
 
     started_at = datetime.datetime.utcnow().isoformat() + "Z"
+    client = OpenAI()
 
     try:
+        # Moderation check
+        if args.moderate:
+            safe = check_moderation(client, args.prompt)
+            if not safe:
+                msg = "⚠️ Prompt blocked by moderation API as unsafe."
+                print(msg)
+                if args.log:
+                    append_log({
+                        "ts": started_at,
+                        "prompt": args.prompt,
+                        "pattern": args.pattern,
+                        "moderation": "blocked",
+                        "output": msg,
+                    })
+                sys.exit(1)
+
+        # Build prompt + send to LLM
         msgs = build_messages(args.pattern, args.system, args.prompt)
         content, usage = ask_openai(args.model, args.temperature, msgs)
 
@@ -125,6 +145,7 @@ def main(argv=None):
                     "completion_tokens": getattr(usage, "completion_tokens", None),
                     "total_tokens": getattr(usage, "total_tokens", None),
                 },
+                "moderation": "passed" if args.moderate else "not_checked",
                 "env": {"user": os.environ.get("USERNAME") or os.environ.get("USER")},
             })
 
