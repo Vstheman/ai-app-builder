@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 # api/rag_chatbot.py
 """
-Day 11+ – RAG Chatbot with Conversational Memory + Auto-Embedding Refresh
+RAG Chatbot with Conversational Memory + Auto-Embedding Refresh + PDF support
 
-Features:
-- Conversational memory (persistent)
-- RAG document retrieval (auto-refresh embeddings)
-- Summarization for long history
-- Moderation & logging
+- Reads .txt, .md, .pdf from data/docs/
+- Per-file cache with content-hash to avoid re-embedding unchanged files
+- Conversational memory, summarization, moderation, logging
 
 Usage:
   python api/rag_chatbot.py
 """
 
-import os, re, sys, json, datetime, glob, hashlib, textwrap
+import os, re, sys, json, glob, hashlib, datetime, textwrap
 import numpy as np
 from pathlib import Path
 from openai import OpenAI
 from retriever import retrieve
+from pypdf import PdfReader  # NEW
 
 # ---------- CONFIG ---------- #
 DATA_DIR = Path("data")
@@ -37,8 +36,9 @@ MAX_HISTORY_CHARS = 5000
 KEEP_RECENT_TURNS = 6
 CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 150
+EMBED_DIM = 1536  # text-embedding-3-small
 
-# ---------- UTILITIES ---------- #
+# ---------- UTILS ---------- #
 def now_iso():
     return datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
@@ -67,8 +67,25 @@ def chunk_text(text: str, max_chars=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
         j = min(i + max_chars, n)
         out.append(t[i:j])
         i = j - overlap if j < n else j
-        if i < 0: i = 0
+        if i < 0:
+            i = 0
     return out
+
+# ---------- PDF TEXT EXTRACTION ---------- #
+def read_pdf_text(path: Path) -> str:
+    """
+    Extract text from a PDF using pypdf.
+    Note: Scanned PDFs without embedded text will yield little/none.
+    """
+    try:
+        reader = PdfReader(str(path))
+        pages = []
+        for pg in reader.pages:
+            pages.append(pg.extract_text() or "")
+        return "\n\n".join(pages)
+    except Exception as e:
+        # Fall back to empty string if unreadable
+        return ""
 
 # ---------- EMBEDDING REFRESH ---------- #
 def embed_chunks(chunks):
@@ -79,23 +96,29 @@ def embed_chunks(chunks):
         vecs.append(resp.data[0].embedding)
     return np.array(vecs, dtype=np.float32)
 
+def cache_key(src_path: str) -> str:
+    # Make windows-safe filename for cache files
+    return re.sub(r"[^\w\-\.]+", "_", src_path)[-200:]
+
 def load_file_cache(src_path: str, file_hash: str):
-    key = re.sub(r"[^\w\-\.]+", "_", src_path)
+    key = cache_key(src_path)
     meta_path = CACHE_DIR / f"{key}.json"
     vec_path = CACHE_DIR / f"{key}.npy"
     if not meta_path.exists() or not vec_path.exists():
         return None
     try:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        if meta.get("sha1") != file_hash:
+        if meta.get("sha1") != file_hash or meta.get("source") != src_path:
             return None
         vecs = np.load(vec_path)
+        if len(meta.get("chunks", [])) != vecs.shape[0]:
+            return None
         return meta, vecs
     except Exception:
         return None
 
 def save_file_cache(src_path: str, file_hash: str, chunks, vecs):
-    key = re.sub(r"[^\w\-\.]+", "_", src_path)
+    key = cache_key(src_path)
     meta_path = CACHE_DIR / f"{key}.json"
     vec_path = CACHE_DIR / f"{key}.npy"
     meta = {"source": src_path, "sha1": file_hash, "chunks": chunks}
@@ -108,18 +131,21 @@ def ensure_embeddings_up_to_date():
     INDEX_JSONL.parent.mkdir(parents=True, exist_ok=True)
     VECTORS_NPY.parent.mkdir(parents=True, exist_ok=True)
 
+    # Collect sources: .txt, .md, .pdf
     items = []
     for p in glob.glob(str(DOCS_DIR / "**" / "*"), recursive=True):
-        if p.lower().endswith((".txt", ".md")):
+        pl = p.lower()
+        if pl.endswith((".txt", ".md", ".pdf")):
             path = Path(p)
             raw = path.read_bytes()
-            h = sha1_bytes(raw)
-            txt = raw.decode("utf-8", errors="ignore")
+            h = sha1_bytes(raw)  # hash raw bytes (works for text & pdf)
+            if pl.endswith(".pdf"):
+                txt = read_pdf_text(path)
+            else:
+                txt = raw.decode("utf-8", errors="ignore")
             items.append((str(path), txt, h))
 
-    all_meta, all_vecs = [], []
-    vec_offset = 0
-
+    all_meta, all_vecs, vec_offset = [], [], 0
     for src, txt, h in items:
         cached = load_file_cache(src, h)
         if cached:
@@ -128,9 +154,13 @@ def ensure_embeddings_up_to_date():
             print(f"• Reused cache ({len(chunks)} chunks) → {src}")
         else:
             chunks = chunk_text(txt)
-            vecs = embed_chunks(chunks)
+            if not chunks:
+                print(f"• Skipped (no extractable text) → {src}")
+                vecs = np.zeros((0, EMBED_DIM), dtype=np.float32)
+            else:
+                vecs = embed_chunks(chunks)
+                print(f"• Embedded {len(chunks)} chunks → {src}")
             save_file_cache(src, h, chunks, vecs)
-            print(f"• Embedded {len(chunks)} chunks → {src}")
 
         all_vecs.append(vecs)
         for k, c in enumerate(chunks):
@@ -142,15 +172,11 @@ def ensure_embeddings_up_to_date():
             })
         vec_offset += len(chunks)
 
-    if all_vecs:
-        mat = np.vstack(all_vecs)
-    else:
-        mat = np.zeros((0, 1536), dtype=np.float32)
+    mat = np.vstack(all_vecs) if any(v.shape[0] for v in all_vecs) else np.zeros((0, EMBED_DIM), dtype=np.float32)
     np.save(VECTORS_NPY, mat)
     with INDEX_JSONL.open("w", encoding="utf-8") as f:
         for m in all_meta:
             f.write(json.dumps(m, ensure_ascii=False) + "\n")
-
     print(f"✅ Embedding index up-to-date ({mat.shape[0]} vectors)\n")
 
 # ---------- RAG CHAT SECTION ---------- #
@@ -164,16 +190,14 @@ def check_moderation(client, text):
 def load_history():
     if CHAT_HISTORY.exists():
         try:
-            with CHAT_HISTORY.open("r", encoding="utf-8") as f:
-                return json.load(f)
+            return json.loads(CHAT_HISTORY.read_text(encoding="utf-8"))
         except Exception:
             pass
     return [{"role": "system", "content": "You are a helpful assistant that answers using the user’s documents."}]
 
 def save_history(history):
     CHAT_HISTORY.parent.mkdir(parents=True, exist_ok=True)
-    with CHAT_HISTORY.open("w", encoding="utf-8") as f:
-        json.dump(history, f, ensure_ascii=False, indent=2)
+    CHAT_HISTORY.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
 
 def append_log(record):
     LOG_JSONL.parent.mkdir(parents=True, exist_ok=True)
@@ -189,15 +213,14 @@ def summarize_history(client, history):
     persona = history[0]
     recent = history[-KEEP_RECENT_TURNS:]
     old = history[1:-KEEP_RECENT_TURNS]
-    plain = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in old if m["role"] in ("user", "assistant"))
+    plain = "\n".join(
+        f"{m['role'].upper()}: {m['content']}"
+        for m in old if m["role"] in ("user", "assistant")
+    )
     prompt = "Summarize this conversation to preserve facts, goals, and context in under 150 words."
     resp = client.chat.completions.create(
-        model=MODEL,
-        temperature=0.2,
-        messages=[
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": plain},
-        ],
+        model=MODEL, temperature=0.2,
+        messages=[{"role":"system","content":prompt}, {"role":"user","content":plain}]
     )
     summary = (resp.choices[0].message.content or "").strip()
     return [persona, {"role": "system", "content": f"Summary memory: {summary}"}] + recent
@@ -206,7 +229,7 @@ def chat_loop():
     client = OpenAI()
     ensure_embeddings_up_to_date()
     history = load_history()
-    print("\n🧠 RAG Chatbot (auto-updates embeddings)\nType 'exit' to quit, 'clear' to reset memory.\n")
+    print("\n🧠 RAG Chatbot (auto-updates embeddings; PDF-ready)\nType 'exit' to quit, 'clear' to reset memory.\n")
 
     while True:
         try:
@@ -230,10 +253,10 @@ def chat_loop():
             continue
 
         contexts = retrieve(user_input, k=3)
-        if contexts:
-            ctx = "\n\n".join(f"[Source {i+1}: {c['source']}] {c['chunk']}" for i, c in enumerate(contexts))
-        else:
-            ctx = "(No relevant documents found.)"
+        ctx = "\n\n".join(
+            f"[Source {i+1}: {c['source']}] {c['chunk']}"
+            for i, c in enumerate(contexts)
+        ) if contexts else "(No relevant documents found.)"
 
         augmented = f"Context:\n{ctx}\n\nQuestion: {user_input}"
         history.append({"role": "user", "content": augmented})
@@ -252,7 +275,7 @@ def chat_loop():
                 "ts": now_iso(),
                 "user": user_input,
                 "assistant": answer,
-                "sources": [c["source"] for c in contexts],
+                "sources": [c["source"] for c in contexts] if contexts else [],
                 "usage": usage_to_dict(getattr(resp, "usage", None))
             })
         except Exception as e:
